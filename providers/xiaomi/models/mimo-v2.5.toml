@@ -1,7 +1,8 @@
 name = "MiMo-V2.5"
+description = "Open MiMo model for multimodal coding agents and long-context automation"
 family = "mimo"
 release_date = "2026-04-22"
-last_updated = "2026-04-22"
+last_updated = "2026-06-24"
 attachment = true
 reasoning = true
 temperature = true
@@ -9,16 +10,13 @@ tool_call = true
 knowledge = "2024-12"
 open_weights = true
 
-[cost]
-input = 0.4
-output = 2
-cache_read = 0.08
+[[reasoning_options]]
+type = "toggle"
 
-[[cost.tiers]]
-tier = { size = 256_000 }
-input = 0.80
-output = 4.00
-cache_read = 0.16
+[cost]
+input = 0.14
+output = 0.28
+cache_read = 0.0028
 
 [limit]
 context = 1_048_576

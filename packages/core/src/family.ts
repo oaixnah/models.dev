@@ -13,6 +13,9 @@ export const ModelFamilyValues = [
   "gpt-pro",
   "gpt-mini",
   "gpt-nano",
+  "gpt-sol",
+  "gpt-terra",
+  "gpt-luna",
   "gpt-oss",
   "gpt-image",
 
@@ -26,6 +29,7 @@ export const ModelFamilyValues = [
   "claude-haiku",
   "claude-sonnet",
   "claude-opus",
+  "claude-fable",
 
   // Gemini style
   "gemini",
@@ -45,12 +49,19 @@ export const ModelFamilyValues = [
   // Meta Llama
   "llama",
 
+  // Meta Muse
+  "muse",
+
   // Alibaba Qwen
   "qwen",
   "qwen3.5",
   "qwen3.6",
+  "qwen3.7-plus",
   "qwen3.7-max",
   "qwen-free",
+
+  // DeepReinforce
+  "ornith",
 
   // DeepSeek
   "deepseek",
@@ -64,10 +75,14 @@ export const ModelFamilyValues = [
 
   // Moonshot Kimi
   "kimi",
-  "kimi-k2.5",
-  "kimi-k2.6",
+  "kimi-k2",
+  "kimi-k3",
   "kimi-free",
   "kimi-thinking",
+
+  // Poolside Laguna
+  "laguna",
+  "laguna-s",
 
   // Mistral family
   "mistral",
@@ -101,6 +116,8 @@ export const ModelFamilyValues = [
   "command-r",
   "command-a",
   "command-light",
+  "north",
+  "north-free",
 
   // AI21 Jamba
   "jamba",
@@ -243,6 +260,9 @@ export const ModelFamilyValues = [
   // Lucid
   "lucid",
 
+  // LucidQuery
+  "agi",
+
   // Intellect
   "intellect",
 
@@ -341,6 +361,9 @@ export const ModelFamilyValues = [
   "auto",
   "model-router",
 
+  // Conductor
+  "fugu",
+
   // V0
   "v0",
 
@@ -419,3 +442,11 @@ export const ModelFamilyValues = [
 
 export const ModelFamily = z.enum(ModelFamilyValues);
 export type ModelFamily = z.infer<typeof ModelFamily>;
+
+export function inferKimiFamily(...values: string[]): ModelFamily | undefined {
+  const target = values.join(" ").toLowerCase();
+  if (/kimi[^a-z0-9]*k2(?:[^a-z0-9]*\d+)?[^a-z0-9]*thinking/.test(target)) return "kimi-thinking";
+  if (/kimi[\s_-]*k2/.test(target)) return "kimi-k2";
+  if (/kimi[\s_-]*k3/.test(target)) return "kimi-k3";
+  return undefined;
+}

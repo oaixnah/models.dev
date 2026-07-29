@@ -1,10 +1,6 @@
-temperature = true
-tool_call = true
+base_model = "zhipuai/glm-4.7"
 structured_output = true
-
-[extends]
-from = "zai/glm-4.7"
-omit = ["cost.cache_write"]
+reasoning_options = []
 
 [interleaved]
 field = "reasoning_details"
@@ -13,11 +9,3 @@ field = "reasoning_details"
 input = 0.4
 output = 1.75
 cache_read = 0.08
-
-[limit]
-context = 202_752
-output = 131_072
-
-[modalities]
-input = ["text"]
-output = ["text"]

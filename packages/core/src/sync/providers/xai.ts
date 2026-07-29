@@ -1,6 +1,8 @@
 import { z } from "zod";
 
-import type { ExistingModel, SyncProvider, SyncedModel } from "../index.js";
+import { describeModel } from "../../describe.js";
+import type { ExistingModel, SyncProvider, SyncedFullModel, SyncedModel } from "../index.js";
+import { factorBaseModel } from "./openrouter.js";
 
 const API_BASE = "https://api.x.ai/v1";
 
@@ -29,7 +31,7 @@ const XAIAPIKey = z.object({
   acls: z.array(z.string()),
 }).passthrough();
 
-type XAIModel = z.infer<typeof XAIModel>;
+export type XAIModel = z.infer<typeof XAIModel>;
 
 export const xai = {
   id: "xai",
@@ -37,7 +39,10 @@ export const xai = {
   modelsDir: "providers/xai/models",
   skipCreates: true,
   sourceID(model) {
-    return model.id;
+    // Alias rows (canonical_id set) exist only to update already-cataloged
+    // alias TOMLs; the canonical row carries the missing-model signal, so
+    // skipped aliases must not be reported as missing models.
+    return model.canonical_id === undefined ? model.id : undefined;
   },
   skippedNotice(ids) {
     if (ids.length === 0) return [];
@@ -67,7 +72,10 @@ export const xai = {
     for (const model of models) {
       if (!seen.has(model.id)) {
         seen.add(model.id);
-        expanded.push(model);
+        // Strip any API-provided canonical_id: sourceID relies on it being set
+        // exclusively by the synthetic alias expansion below, so an API row
+        // carrying it must not be mistaken for an alias and silently skipped.
+        expanded.push({ ...model, canonical_id: undefined });
       }
     }
 
@@ -87,7 +95,7 @@ export const xai = {
 
     return {
       id: model.id,
-      model: buildModel(model, existing),
+      model: buildXAIModel(model, existing),
     };
   },
 } satisfies SyncProvider<XAIModel>;
@@ -115,10 +123,6 @@ async function fetchTypedModels(key: string, endpoint: string) {
   }
 
   return XAIModelList.parse(await response.json()).models;
-}
-
-function dateFromTimestamp(timestamp: number) {
-  return new Date(timestamp * 1000).toISOString().slice(0, 10);
 }
 
 type Modality = "text" | "audio" | "image" | "video" | "pdf";
@@ -159,8 +163,9 @@ function cost(model: XAIModel, existing: ExistingModel) {
   };
 }
 
-function buildModel(model: XAIModel, existing: ExistingModel): SyncedModel {
+export function buildXAIModel(model: XAIModel, existing: ExistingModel): SyncedModel {
   const name = existing.name;
+  const description = existing.description;
   const attachment = existing.attachment;
   const reasoning = existing.reasoning;
   const toolCall = existing.tool_call;
@@ -176,23 +181,38 @@ function buildModel(model: XAIModel, existing: ExistingModel): SyncedModel {
     || toolCall === undefined
     || openWeights === undefined
     || limit === undefined
-    || (model.canonical_id !== undefined && releaseDate === undefined)
-    || (model.canonical_id !== undefined && lastUpdated === undefined)
+    || releaseDate === undefined
+    || lastUpdated === undefined
   ) {
     throw new Error(`xAI model ${model.id} has incomplete local TOML metadata required for sync`);
   }
 
   const input = modalities(model.input_modalities, existing.modalities?.input ?? ["text"]);
   const output = modalities(model.output_modalities, existing.modalities?.output ?? ["text"]);
-  const created = dateFromTimestamp(model.created);
 
-  return {
+  const values = {
     name,
+    description: description ?? describeModel({
+      id: model.id,
+      name,
+      family: existing.family,
+      reasoning,
+      tool_call: toolCall,
+      structured_output: existing.structured_output,
+      open_weights: openWeights,
+      limit: {
+        input: limit.input,
+        context: model.max_prompt_length ?? limit.context,
+        output: limit.output,
+      },
+      modalities: { input, output },
+    }),
     family: existing.family,
-    release_date: model.canonical_id === undefined ? created : releaseDate!,
-    last_updated: model.canonical_id === undefined ? created : lastUpdated!,
+    release_date: releaseDate,
+    last_updated: lastUpdated,
     attachment: input.some((value) => value !== "text"),
     reasoning,
+    reasoning_options: existing.reasoning_options,
     temperature: existing.temperature,
     tool_call: toolCall,
     structured_output: existing.structured_output,
@@ -207,5 +227,9 @@ function buildModel(model: XAIModel, existing: ExistingModel): SyncedModel {
       output: limit.output,
     },
     modalities: { input, output },
-  };
+  } satisfies SyncedFullModel;
+
+  return existing.base_model === undefined
+    ? values
+    : factorBaseModel(existing.base_model, values, values.limit, existing.base_model_omit);
 }

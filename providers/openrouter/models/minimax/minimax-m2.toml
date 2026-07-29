@@ -1,22 +1,14 @@
-temperature = true
-tool_call = true
+base_model = "minimax/MiniMax-M2"
 structured_output = true
-
-[extends]
-from = "minimax/MiniMax-M2"
+reasoning_options = []
 
 [interleaved]
 field = "reasoning_details"
 
 [cost]
 input = 0.255
-output = 1
-cache_read = 0.03
+output = 1.02
 
 [limit]
-context = 196_608
-output = 196_608
-
-[modalities]
-input = ["text"]
-output = ["text"]
+context = 204_800
+output = 131_072

@@ -1,7 +1,9 @@
 name = "deepseek-v4-pro"
+description = "Flagship DeepSeek model for coding, reasoning, and agentic work"
 family = "deepseek-thinking"
 attachment = false
 reasoning = true
+reasoning_options = [{ type = "toggle" }, { type = "effort", values = ["high", "max"] }]
 tool_call = true
 release_date = "2026-04-24"
 last_updated = "2026-04-24"

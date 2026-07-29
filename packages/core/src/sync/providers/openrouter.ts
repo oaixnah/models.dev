@@ -2,30 +2,45 @@ import { z } from "zod";
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 
-import { ModelFamilyValues } from "../../family.js";
+import { describeModel } from "../../describe.js";
+import { inferKimiFamily, ModelFamilyValues } from "../../family.js";
 import type { ExistingModel, SyncProvider, SyncedFullModel, SyncedModel } from "../index.js";
 
 const API_ENDPOINT = "https://openrouter.ai/api/v1/models";
-const PROVIDERS_DIR = path.join(import.meta.dirname, "..", "..", "..", "..", "..", "providers");
-const modelFilesByProvider = new Map<string, Set<string>>();
-const canonicalTomlByModel = new Map<string, Record<string, unknown>>();
+const MODELS_DIR = path.join(import.meta.dirname, "..", "..", "..", "..", "..", "models");
+const modelMetadataByID = new Map<string, Record<string, unknown>>();
+const modelMetadataFilesByProvider = new Map<string, Set<string>>();
+
+const CANONICAL_BASE_MODEL_OVERRIDES = {
+  "openai/gpt-5.6-luna-pro": "openai/gpt-5.6-luna",
+  "openai/gpt-5.6-sol-pro": "openai/gpt-5.6-sol",
+  "openai/gpt-5.6-terra-pro": "openai/gpt-5.6-terra",
+  "anthropic/claude-opus-4.7-fast": "anthropic/claude-opus-4-7",
+  "anthropic/claude-opus-4.8-fast": "anthropic/claude-opus-4-8",
+} as const;
 
 const CANONICAL_PROVIDER_PREFIXES = {
-  anthropic: "anthropic",
-  cohere: "cohere",
-  deepseek: "deepseek",
-  google: "google",
-  meta: "llama",
-  "meta-llama": "llama",
-  minimax: "minimax",
-  mistralai: "mistral",
-  moonshotai: "moonshotai",
-  openai: "openai",
-  "x-ai": "xai",
-  xai: "xai",
-  xiaomi: "xiaomi",
-  zai: "zai",
-  "z-ai": "zai",
+  alibaba: { provider: "alibaba", metadata: "alibaba" },
+  anthropic: { provider: "anthropic", metadata: "anthropic" },
+  cohere: { provider: "cohere", metadata: "cohere" },
+  deepseek: { provider: "deepseek", metadata: "deepseek" },
+  google: { provider: "google", metadata: "google" },
+  meta: { provider: "llama", metadata: "meta" },
+  "meta-llama": { provider: "llama", metadata: "meta" },
+  minimax: { provider: "minimax", metadata: "minimax" },
+  mistralai: { provider: "mistral", metadata: "mistral" },
+  moonshotai: { provider: "moonshotai", metadata: "moonshotai" },
+  openai: { provider: "openai", metadata: "openai" },
+  nvidia: { provider: "nvidia", metadata: "nvidia" },
+  qwen: { provider: "alibaba", metadata: "alibaba" },
+  stepfun: { provider: "stepfun", metadata: "stepfun" },
+  tencent: { provider: "tencent", metadata: "tencent" },
+  thinkingmachines: { provider: "thinkingmachines", metadata: "thinkingmachines" },
+  "x-ai": { provider: "xai", metadata: "xai" },
+  xai: { provider: "xai", metadata: "xai" },
+  xiaomi: { provider: "xiaomi", metadata: "xiaomi" },
+  zai: { provider: "zai", metadata: "zhipuai" },
+  "z-ai": { provider: "zai", metadata: "zhipuai" },
 } as const;
 
 export const OpenRouterModel = z.object({
@@ -51,6 +66,17 @@ export const OpenRouterModel = z.object({
     max_completion_tokens: z.number().nullable(),
   }),
   supported_parameters: z.array(z.string()),
+  reasoning: z
+    .object({
+      mandatory: z.boolean(),
+      supported_efforts: z
+        .array(z.enum(["max", "xhigh", "high", "medium", "low", "minimal", "none"]))
+        .nullable()
+        .optional(),
+      supports_max_tokens: z.boolean().optional(),
+    })
+    .passthrough()
+    .optional(),
 });
 
 export const OpenRouterResponse = z.object({
@@ -74,15 +100,33 @@ export const openrouter = {
     return response.json();
   },
   parseModels(raw) {
-    return OpenRouterResponse.parse(raw).data;
+    // Temporarily skip batch routes (`*:batch`) — they are not catalog targets.
+    return OpenRouterResponse.parse(raw).data.filter((model) => !model.id.endsWith(":batch"));
   },
   translateModel(model, context) {
+    // OpenRouter serves deprecated/unavailable routes as degraded stubs:
+    // negative pricing (`"-1"`) and an empty `supported_parameters` array. Syncing
+    // those would wrongly flip `reasoning`/`tool_call`/`structured_output` to false
+    // and strip `reasoning_options`. Leave the authored file untouched instead, and
+    // skip the model entirely when we have nothing to preserve.
+    if (isUnavailable(model)) {
+      const authored = context.authored(model.id);
+      return authored === undefined ? undefined : { id: model.id, model: authored as SyncedModel };
+    }
     return {
       id: model.id,
       model: buildOpenRouterModel(model, context.existing(model.id)),
     };
   },
 } satisfies SyncProvider<OpenRouterModel>;
+
+function isUnavailable(model: OpenRouterModel) {
+  return (
+    model.supported_parameters.length === 0 ||
+    Number(model.pricing.prompt) < 0 ||
+    Number(model.pricing.completion) < 0
+  );
+}
 
 function dateFromTimestamp(timestamp: number) {
   return new Date(timestamp * 1000).toISOString().slice(0, 10);
@@ -108,6 +152,9 @@ function modalities(values: string[], fallback: Modality[]): Modality[] {
 }
 
 function inferFamily(model: OpenRouterModel, name: string) {
+  const kimiFamily = inferKimiFamily(model.id, name);
+  if (kimiFamily !== undefined) return kimiFamily;
+
   const target = `${model.id} ${name}`.toLowerCase();
   return [...ModelFamilyValues]
     .sort((a, b) => b.length - a.length)
@@ -120,7 +167,11 @@ function inferFamily(model: OpenRouterModel, name: string) {
     });
 }
 
-export function buildOpenRouterModel(model: OpenRouterModel, existing: ExistingModel | undefined): SyncedModel {
+export function buildOpenRouterModel(
+  model: OpenRouterModel,
+  existing: ExistingModel | undefined,
+  baseModel?: string,
+): SyncedModel {
   const params = new Set(model.supported_parameters);
   const name = model.name.replace(/^[^:]+:\s+/, "");
   const input = modalities(model.architecture.input_modalities, ["text"]);
@@ -128,7 +179,12 @@ export function buildOpenRouterModel(model: OpenRouterModel, existing: ExistingM
   const prompt = price(model.pricing.prompt);
   const completion = price(model.pricing.completion);
   const reasoning = params.has("reasoning") || params.has("include_reasoning");
-  const context = model.top_provider.context_length ?? model.context_length;
+  // Prefer OpenRouter's live reasoning metadata over authored options so aliases
+  // and rotated models pick up new efforts/budget support. Fall back to authored
+  // only when the API omits a reasoning object.
+  const reasoning_options = openRouterReasoningOptions(model.reasoning)
+    ?? (reasoning ? existing?.reasoning_options : undefined);
+  const context = model.context_length;
   const family = inferFamily(model, name);
   const releaseDate = dateFromTimestamp(model.created);
   const familyValue = existing?.family === "o" && family !== "o"
@@ -154,37 +210,63 @@ export function buildOpenRouterModel(model: OpenRouterModel, existing: ExistingM
     input: existing?.limit?.input,
     output: model.top_provider.max_completion_tokens ?? existing?.limit?.output ?? context,
   };
-  const canonical = resolveCanonicalModel(model.id);
+  const canonical = existing?.base_model ?? baseModel ?? resolveCanonicalBaseModel(model.id);
 
   if (canonical !== undefined) {
-    return {
-      extends: {
-        from: canonical.from,
-        omit: canonicalOmit(canonical.provider, canonical.modelID, cost, limit),
-      },
-      ...canonicalRuntimeOverrides(canonical.provider, canonical.modelID, {
-        name: model.id.endsWith(":free") ? name : undefined,
+    const canonicalOverride = canonicalBaseModelOverride(model.id);
+    return factorBaseModel(
+      canonical,
+      {
+        name: shouldPreserveFactoredName(model.id, canonical, baseModel, canonicalOverride)
+          ? name
+          : undefined,
+        description: existing?.description ?? describeModel({
+          id: model.id,
+          name,
+          family: familyValue,
+          reasoning,
+          tool_call: toolCall,
+          structured_output: structuredOutput,
+          open_weights: openWeights,
+          limit,
+          modalities: { input, output },
+        }),
         attachment,
         reasoning,
-      }),
-      temperature: params.has("temperature"),
-      tool_call: toolCall,
-      structured_output: structuredOutput,
-      status: existing?.status,
-      interleaved: existing?.interleaved,
-      cost,
+        reasoning_options,
+        temperature: params.has("temperature"),
+        tool_call: toolCall,
+        structured_output: structuredOutput,
+        status: existing?.status,
+        interleaved: existing?.interleaved,
+        limit,
+        modalities: { input, output },
+        cost,
+      },
       limit,
-      modalities: { input, output },
-    };
+      existing?.base_model === canonical ? existing.base_model_omit : undefined,
+    );
   }
 
   return {
     name,
+    description: existing?.description ?? describeModel({
+      id: model.id,
+      name,
+      family: familyValue,
+      reasoning,
+      tool_call: toolCall,
+      structured_output: structuredOutput,
+      open_weights: openWeights,
+      limit,
+      modalities: { input, output },
+    }),
     family: familyValue,
     release_date: releaseDate,
     last_updated: releaseDate,
     attachment,
     reasoning,
+    reasoning_options,
     temperature: params.has("temperature"),
     tool_call: toolCall,
     structured_output: structuredOutput,
@@ -198,75 +280,110 @@ export function buildOpenRouterModel(model: OpenRouterModel, existing: ExistingM
   } satisfies SyncedFullModel;
 }
 
-function resolveCanonicalModel(openrouterID: string) {
+function openRouterReasoningOptions(reasoning: OpenRouterModel["reasoning"]): SyncedFullModel["reasoning_options"] {
+  if (reasoning === undefined) return undefined;
+
+  const options: NonNullable<SyncedFullModel["reasoning_options"]> = [];
+  const efforts = reasoning.supported_efforts === null
+    ? ["max", "xhigh", "high", "medium", "low", "minimal", "none"] as const
+    : reasoning.supported_efforts;
+
+  if (efforts !== undefined) {
+    options.push({
+      type: "effort",
+      values: reasoning.mandatory ? efforts.filter((value) => value !== "none") : [...efforts],
+    });
+  }
+
+  if (reasoning.supports_max_tokens === true) {
+    options.push({ type: "budget_tokens" });
+  }
+
+  return options.length > 0 ? options : undefined;
+}
+
+export function resolveCanonicalBaseModel(openrouterID: string) {
+  const override = canonicalBaseModelOverride(openrouterID);
+  if (override !== undefined) return override;
+
   const [prefix, ...modelParts] = openrouterID.split("/");
   if (prefix === undefined || modelParts.length === 0) return undefined;
   if (openrouterID.startsWith("~/") || prefix.startsWith("~")) return undefined;
 
-  const provider = CANONICAL_PROVIDER_PREFIXES[prefix as keyof typeof CANONICAL_PROVIDER_PREFIXES];
-  if (provider === undefined) return undefined;
+  const canonical = CANONICAL_PROVIDER_PREFIXES[prefix as keyof typeof CANONICAL_PROVIDER_PREFIXES];
+  if (canonical === undefined) return undefined;
 
   const modelID = modelParts.join("/").replace(/:free$/, "");
-  const candidates = canonicalCandidates(provider, modelID);
+  const candidates = canonicalCandidates(canonical.provider, modelID);
   const match = candidates.find((candidate) => {
-    return canonicalModelExists(provider, candidate);
+    return modelMetadataExists(canonical.metadata, candidate);
   });
 
-  return match === undefined
-    ? undefined
-    : {
-        from: `${provider}/${match}`,
-        provider,
-        modelID: match,
-      };
+  return match === undefined ? undefined : `${canonical.metadata}/${match}`;
 }
 
-function canonicalModelExists(provider: string, modelID: string) {
-  let files = modelFilesByProvider.get(provider);
+function modelMetadataExists(provider: string, modelID: string) {
+  let files = modelMetadataFilesByProvider.get(provider);
   if (files === undefined) {
     try {
-      files = new Set(readdirSync(path.join(PROVIDERS_DIR, provider, "models")));
+      files = new Set(readdirSync(path.join(MODELS_DIR, provider)));
     } catch {
       files = new Set();
     }
-    modelFilesByProvider.set(provider, files);
+    modelMetadataFilesByProvider.set(provider, files);
   }
   return files.has(`${modelID}.toml`);
 }
 
-function canonicalOmit(
-  provider: string,
+function canonicalBaseModelOverride(openrouterID: string) {
+  return CANONICAL_BASE_MODEL_OVERRIDES[
+    openrouterID as keyof typeof CANONICAL_BASE_MODEL_OVERRIDES
+  ];
+}
+
+function shouldPreserveFactoredName(
   modelID: string,
-  cost: SyncedFullModel["cost"],
+  canonical: string,
+  baseModel: string | undefined,
+  canonicalOverride: string | undefined,
+) {
+  if (baseModel !== undefined) return true;
+  if (modelID.endsWith(":free")) return true;
+  if (canonicalOverride === canonical) return true;
+  const modelSlug = modelID.split("/").slice(1).join("/").replace(/:free$/, "");
+  const canonicalSlug = canonical.split("/").slice(1).join("/");
+  return normalizeModelSlug(modelSlug) !== normalizeModelSlug(canonicalSlug);
+}
+
+function normalizeModelSlug(value: string) {
+  return value.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+}
+
+export function factorBaseModel(
+  modelID: string,
+  values: Partial<SyncedFullModel>,
+  limit: SyncedFullModel["limit"],
+  existingOmit?: string[],
+): SyncedModel {
+  return {
+    base_model: modelID,
+    base_model_omit: existingOmit ?? baseModelOmit(modelID, limit),
+    ...baseModelOverrides(modelID, values),
+  };
+}
+
+function baseModelOmit(
+  modelID: string,
   limit: SyncedFullModel["limit"],
 ) {
-  const toml = canonicalToml(provider, modelID);
-  const omit = ["provider", "experimental"].filter((key) => toml[key] !== undefined);
-
-  const baseCost = toml.cost;
-  if (baseCost !== undefined && baseCost !== null && typeof baseCost === "object" && !Array.isArray(baseCost)) {
-    if (cost === undefined) {
-      omit.push("cost");
-    } else {
-      for (const key of ["reasoning", "cache_read", "cache_write", "input_audio", "output_audio", "tiers"] as const) {
-        if ((baseCost as Record<string, unknown>)[key] !== undefined && cost[key] === undefined) {
-          omit.push(`cost.${key}`);
-        }
-      }
-      if (hasLegacyContextOver200k(baseCost) && cost.tiers === undefined) {
-        omit.push("cost.context_over_200k");
-      }
-    }
-  }
-
-  const baseLimit = toml.limit;
+  const metadata = modelMetadata(modelID);
+  const omit: string[] = [];
+  const baseLimit = metadata.limit;
   if (
-    baseLimit !== undefined &&
-    baseLimit !== null &&
-    typeof baseLimit === "object" &&
-    !Array.isArray(baseLimit) &&
-    (baseLimit as Record<string, unknown>).input !== undefined &&
-    limit.input === undefined
+    isPlainObject(baseLimit) &&
+    baseLimit.input !== undefined &&
+    limit.input === undefined &&
+    baseLimit.context !== limit.context
   ) {
     omit.push("limit.input");
   }
@@ -274,47 +391,92 @@ function canonicalOmit(
   return omit.length > 0 ? omit : undefined;
 }
 
-function hasLegacyContextOver200k(cost: object) {
-  const tiers = (cost as { tiers?: unknown }).tiers;
-  if (!Array.isArray(tiers) || tiers.length !== 1) return false;
-
-  const tier = tiers[0];
-  if (tier === null || typeof tier !== "object" || Array.isArray(tier)) return false;
-  const tierConfig = (tier as { tier?: unknown }).tier;
-  if (tierConfig === null || typeof tierConfig !== "object" || Array.isArray(tierConfig)) return false;
-
-  const size = (tierConfig as { size?: unknown }).size;
-  return typeof size === "number" && size >= 200_000;
-}
-
-function canonicalRuntimeOverrides(
-  provider: string,
+function baseModelOverrides(
   modelID: string,
-  values: Pick<SyncedFullModel, "name" | "attachment" | "reasoning">,
+  values: Partial<SyncedFullModel>,
 ) {
-  const toml = canonicalToml(provider, modelID);
-  return Object.fromEntries(
-    Object.entries(values).filter(([key, value]) => value !== undefined && toml[key] !== value),
-  );
+  const metadata = modelMetadata(modelID);
+  const result: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(values)) {
+    const override = inheritedOverride(value, metadata[key]);
+    if (override !== undefined) result[key] = override;
+  }
+
+  return result;
 }
 
-function canonicalToml(provider: string, modelID: string) {
-  const key = `${provider}/${modelID}`;
-  let toml = canonicalTomlByModel.get(key);
-  if (toml === undefined) {
-    const filePath = path.join(PROVIDERS_DIR, provider, "models", `${modelID}.toml`);
-    toml = Bun.TOML.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
-    canonicalTomlByModel.set(key, toml);
+function inheritedOverride(value: unknown, inherited: unknown): unknown {
+  if (value === undefined) return undefined;
+  if (sameInheritedValue(value, inherited)) return undefined;
+  if (isPlainObject(value) && isPlainObject(inherited)) {
+    const overrides = Object.fromEntries(
+      Object.entries(value)
+        .map(([key, item]) => [key, inheritedOverride(item, inherited[key])])
+        .filter(([, item]) => item !== undefined),
+    );
+    return Object.keys(overrides).length > 0 ? overrides : undefined;
   }
-  return toml;
+  return stripUndefined(value);
+}
+
+function stripUndefined(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripUndefined);
+  if (isPlainObject(value)) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, item]) => item !== undefined)
+        .map(([key, item]) => [key, stripUndefined(item)]),
+    );
+  }
+  return value;
+}
+
+function sameInheritedValue(value: unknown, inherited: unknown) {
+  return stableInheritedValue(value) === stableInheritedValue(inherited);
+}
+
+function stableInheritedValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    const items = value.map(stableInheritedValue);
+    const ordered = value.every((item) => item === null || typeof item !== "object")
+      ? items.sort()
+      : items;
+    return `[${ordered.join(",")}]`;
+  }
+  if (isPlainObject(value)) {
+    return `{${Object.entries(value)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableInheritedValue(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function modelMetadata(modelID: string) {
+  let metadata = modelMetadataByID.get(modelID);
+  if (metadata === undefined) {
+    const filePath = path.join(MODELS_DIR, `${modelID}.toml`);
+    metadata = Bun.TOML.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+    modelMetadataByID.set(modelID, metadata);
+  }
+  return metadata;
 }
 
 function canonicalCandidates(provider: string, modelID: string) {
   const candidates = [modelID];
+  if (modelID.endsWith("-fast")) candidates.push(modelID.slice(0, -"-fast".length));
 
   if (provider === "anthropic") {
-    candidates.push(modelID.replace(/(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)/, "$1-$2"));
-    candidates.push(modelID.replace(/^claude-3\.5-/, "claude-3-5-"));
+    for (const candidate of [...candidates]) {
+      candidates.push(candidate.replace(/(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)/, "$1-$2"));
+      candidates.push(candidate.replace(/^claude-3\.5-/, "claude-3-5-"));
+    }
   }
 
   if (provider === "llama") {

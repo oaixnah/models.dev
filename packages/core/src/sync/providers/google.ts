@@ -1,6 +1,8 @@
 import { z } from "zod";
 
-import type { ExistingModel, SyncProvider, SyncedModel } from "../index.js";
+import { describeModel } from "../../describe.js";
+import type { ExistingModel, SyncProvider, SyncedFullModel, SyncedModel } from "../index.js";
+import { factorBaseModel } from "./openrouter.js";
 
 const API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -27,13 +29,31 @@ const GoogleResponse = z.object({
 
 type GoogleModel = z.infer<typeof GoogleModel>;
 
+const TrackedModelPrefixes = [
+  "deep-research-",
+  "gemini-",
+  "gemma-",
+  "imagen-",
+  "lyria-",
+  "nano-banana-",
+  "veo-",
+];
+
+export function shouldTrackGoogleModel(id: string) {
+  return TrackedModelPrefixes.some((prefix) => id.startsWith(prefix));
+}
+
 export const google = {
   id: "google",
   name: "Google",
   modelsDir: "providers/google/models",
   skipCreates: true,
+  // /v1beta/models has no lifecycle fields and can retain shut-down,
+  // superseded, moving-alias, and EAP model IDs.
+  trackMissingModels: false,
   sourceID(model) {
-    return model.name.replace(/^models\//, "");
+    const id = model.name.replace(/^models\//, "");
+    return shouldTrackGoogleModel(id) ? id : undefined;
   },
   skippedNotice(ids) {
     if (ids.length === 0) return [];
@@ -81,13 +101,14 @@ export const google = {
 
     return {
       id,
-      model: buildModel(model, existing),
+      model: buildGoogleModel(model, existing),
     };
   },
 } satisfies SyncProvider<GoogleModel>;
 
-function buildModel(model: GoogleModel, existing: ExistingModel): SyncedModel {
+export function buildGoogleModel(model: GoogleModel, existing: ExistingModel): SyncedModel {
   const name = existing.name;
+  const description = existing.description;
   const releaseDate = existing.release_date;
   const lastUpdated = existing.last_updated;
   const attachment = existing.attachment;
@@ -111,8 +132,23 @@ function buildModel(model: GoogleModel, existing: ExistingModel): SyncedModel {
     throw new Error(`Google model ${model.name} has incomplete local TOML metadata required for sync`);
   }
 
-  return {
+  const synced: SyncedFullModel = {
     name: model.displayName ?? name,
+    description: description ?? model.description ?? describeModel({
+      id: model.name.replace(/^models\//, ""),
+      name: model.displayName ?? name,
+      family: existing.family,
+      reasoning: model.thinking ?? reasoning,
+      tool_call: toolCall,
+      structured_output: existing.structured_output,
+      open_weights: openWeights,
+      limit: {
+        input: limit.input,
+        context: model.inputTokenLimit,
+        output: model.outputTokenLimit,
+      },
+      modalities,
+    }),
     family: existing.family,
     release_date: releaseDate,
     last_updated: lastUpdated,
@@ -121,6 +157,7 @@ function buildModel(model: GoogleModel, existing: ExistingModel): SyncedModel {
     temperature: model.temperature !== undefined || model.maxTemperature !== undefined
       ? true
       : existing.temperature,
+    reasoning_options: existing.reasoning_options,
     tool_call: toolCall,
     structured_output: existing.structured_output,
     knowledge: existing.knowledge,
@@ -135,4 +172,8 @@ function buildModel(model: GoogleModel, existing: ExistingModel): SyncedModel {
     },
     modalities,
   };
+
+  return existing.base_model === undefined
+    ? synced
+    : factorBaseModel(existing.base_model, synced, synced.limit, existing.base_model_omit);
 }
